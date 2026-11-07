@@ -1,0 +1,208 @@
+services:
+  postgres:
+    restart: unless-stopped
+    image: postgres:17-alpine
+    mem_limit: 256m
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-siem}
+      POSTGRES_USER: ${POSTGRES_USER:-siem}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-siem_dev_password}
+    ports:
+      - "${POSTGRES_BIND_HOST:-127.0.0.1}:${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./backend/migrations:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    restart: unless-stopped
+    image: redis:7-alpine
+    mem_limit: 128m
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "${REDIS_BIND_HOST:-127.0.0.1}:${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  snapshot-init:
+    image: alpine:3.22
+    # Elasticsearch uses UID 1000. Docker named volumes start root-owned.
+    # This one-shot container only touches the snapshot volume.
+    command: ["sh", "-c", "mkdir -p /snapshots/siem-vps-local && chown 1000:0 /snapshots /snapshots/siem-vps-local"]
+    user: "0:0"
+    volumes:
+      - elasticsearch_snapshots:/snapshots
+    restart: "no"
+  elasticsearch:
+    restart: unless-stopped
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.19.0
+    depends_on:
+      snapshot-init:
+        condition: service_completed_successfully
+    mem_limit: 768m
+    environment:
+      discovery.type: single-node
+      path.repo: /snapshots
+      xpack.security.enabled: "false"
+      ES_JAVA_OPTS: -Xms256m -Xmx384m
+    ports:
+      - "${ELASTICSEARCH_BIND_HOST:-127.0.0.1}:${ELASTICSEARCH_PORT:-9200}:9200"
+    volumes:
+      - elasticsearch_data:/usr/share/elasticsearch/data
+      - elasticsearch_snapshots:/snapshots
+    healthcheck:
+      test: ["CMD-SHELL", "curl -s http://localhost:9200/_cat/health | grep -qE 'green|yellow'"]
+      interval: 10s
+      timeout: 10s
+      retries: 15
+      start_period: 40s
+
+  backend:
+    restart: unless-stopped
+    build: ./backend
+    mem_limit: 256m
+    environment:
+      API_ADDR: :8080
+      EVENT_RETENTION_DAYS: ${EVENT_RETENTION_DAYS:-30}
+      INTEL_FEED_FILE: ${INTEL_FEED_FILE:-}
+      INTEL_PROVIDER_URL: ${INTEL_PROVIDER_URL:-}
+      INTEL_PROVIDER_TOKEN: ${INTEL_PROVIDER_TOKEN:-}
+      MODE: ${MODE:-develop}
+      POSTGRES_URL: postgres://${POSTGRES_USER:-siem}:${POSTGRES_PASSWORD:-siem_dev_password}@postgres:5432/${POSTGRES_DB:-siem}?sslmode=disable
+      REDIS_URL: redis://redis:6379/0
+      ELASTICSEARCH_URL: http://elasticsearch:9200
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
+      JWT_SECRET: ${JWT_SECRET:-change-me-in-production}
+      ADMIN_EMAIL: ${ADMIN_EMAIL:-admin@example.com}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-change-me-now}
+      PARSER_BATCH_SIZE: ${PARSER_BATCH_SIZE:-100}
+      PARSER_WORKERS: ${PARSER_WORKERS:-4}
+    ports:
+      - "${API_BIND_HOST:-127.0.0.1}:${API_PORT:-8080}:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      elasticsearch:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8080/healthz | grep -q 'healthy'"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 15s
+
+  logstash:
+    image: docker.elastic.co/logstash/logstash:8.19.0
+    profiles: ["elastic-stack"]
+    volumes:
+      - ./config/logstash-pipeline.conf:/usr/share/logstash/pipeline/logstash.conf:ro
+    ports:
+      - "${BEATS_BIND_HOST:-127.0.0.1}:${BEATS_PORT:-5044}:5044"
+    depends_on:
+      backend:
+        condition: service_healthy
+
+  fleet-server:
+    image: docker.elastic.co/beats/elastic-agent:8.19.0
+    profiles: ["elastic-stack"]
+    command: ["-e", "-d", "fleet-server"]
+    environment:
+      FLEET_SERVER_ENABLE: "1"
+      FLEET_SERVER_INSECURE: "true"
+      FLEET_SERVER_INSECURE_HTTP: "true"
+      FLEET_SERVER_PORT: "8220"
+      FLEET_SERVER_HOST: "0.0.0.0"
+      FLEET_SERVER_ELASTICSEARCH_HOST: "http://elasticsearch:9200"
+      ELASTICSEARCH_HOSTS: "http://elasticsearch:9200"
+    ports:
+      - "${FLEET_BIND_HOST:-127.0.0.1}:${FLEET_PORT:-8220}:8220"
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    restart: unless-stopped
+
+  elastic-agent:
+    image: docker.elastic.co/beats/elastic-agent:8.19.0
+    profiles: ["elastic-stack"]
+    user: root
+    volumes:
+      - ./config/elastic-agent.yml:/usr/share/elastic-agent/elastic-agent.yml:ro
+      - /var/log:/var/log:ro
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+    depends_on:
+      fleet-server:
+        condition: service_started
+      logstash:
+        condition: service_started
+    restart: unless-stopped
+
+  ingest:
+    # One-shot stdin importer, NOT a background service.
+    profiles: ["manual-tools"]
+    build: ./backend
+    entrypoint: ["/siem-ingest"]
+    mem_limit: 128m
+    environment:
+      REDIS_URL: redis://redis:6379/0
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  frontend:
+    restart: unless-stopped
+    build:
+      context: ./frontend
+      args:
+        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:8080}
+        NEXT_PUBLIC_MODE: ${MODE:-develop}
+    mem_limit: 512m
+    environment:
+      NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:8080}
+      NEXT_PUBLIC_MODE: ${MODE:-production}
+    ports:
+      - "${FRONTEND_BIND_HOST:-127.0.0.1}:${FRONTEND_PORT:-3000}:3000"
+    depends_on:
+      backend:
+        condition: service_healthy
+
+  caddy:
+    image: caddy:2.10.2-alpine
+    profiles: ["production"]
+    restart: unless-stopped
+    environment:
+      SIEM_DOMAIN: ${SIEM_DOMAIN:-localhost}
+      ACME_EMAIL: ${ACME_EMAIL:-}
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./ops/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      backend:
+        condition: service_healthy
+      frontend:
+        condition: service_started
+
+
+volumes:
+  postgres_data:
+  redis_data:
+  elasticsearch_data:
+  elasticsearch_snapshots:
+  caddy_data:
+  caddy_config:

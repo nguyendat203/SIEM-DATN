@@ -1,0 +1,22 @@
+# Environment
+.env
+.env.*
+!.env.example
+
+# Go
+backend/bin/
+backend/vendor/
+
+# Node
+frontend/node_modules/
+frontend/.next/
+frontend/out/
+
+# OS & Binaries
+.DS_Store
+*.exe
+
+# Test artifacts & credentials
+frontend/playwright-report/
+frontend/test-results/
+scripts/.agent-credentials.json
